@@ -10,6 +10,8 @@ from typing import Required, TypedDict
 
 import aiohttp
 from bs4 import BeautifulSoup
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn
+from rich.console import Console
 
 
 BASE_URL = "https://packagecontrol.io/packages/{}"
@@ -34,6 +36,9 @@ type OutputFormat = dict[Name, PackageInfo]
 
 
 async def main(registry: str, output: str, limit: int | None = 20) -> None:
+    console = Console()
+    # Detect CI or non-interactive environment
+    disable_progress = not console.is_terminal or os.environ.get("CI") == "true"
     try:
         with open(registry, "r", encoding="utf-8") as f:
             registry_ = json.load(f)
@@ -52,7 +57,23 @@ async def main(registry: str, output: str, limit: int | None = 20) -> None:
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [fetch_package(session, name, now_string) for name in to_scrape]
-        results = await asyncio.gather(*tasks)
+        results = []
+        with Progress(
+            TextColumn("[bold blue]Scraping Packages:"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,  # Show the bar and stats after completion
+            disable=disable_progress
+        ) as progress:
+            task_id = progress.add_task("scrape", total=len(tasks))
+            for coro in asyncio.as_completed(tasks):
+                res = await coro
+                if res is not None:
+                    results.append(res)
+                progress.update(task_id, advance=1)
 
     # Merge with existing data
     for res in results:
@@ -64,7 +85,10 @@ async def main(registry: str, output: str, limit: int | None = 20) -> None:
     with open(output, "w", encoding="utf-8") as f:
         json.dump(existing_data, f, indent=2)
 
-    print(f"Scraped {len(results)} packages, saved to {args.output}")
+    elapsed = progress.tasks[task_id].finished_time or 0
+    s_per_package = elapsed / len(results) if len(results) > 0 else 0
+    print(f"Scraped {len(results)} packages, {s_per_package * 1000:.1f}ms per package.")
+    print(f"Saved to {output}")
 
 
 def load_existing_data(output_path) -> OutputFormat:
