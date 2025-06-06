@@ -1,0 +1,199 @@
+import argparse
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from urllib.parse import quote
+
+from typing import Required, TypedDict
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+
+BASE_URL = "https://packagecontrol.io/packages/{}"
+DEFAULT_REGISTRY = "./registry.json"
+DEFAULT_OUTPUT = "./packages_info.json"
+
+type Name = str
+type IsoTimestamp = str
+
+class PackageInfo(TypedDict, total=False):
+    name: Required[Name]
+    first_seen: str | None
+    total_installs: int
+    win_installs: int
+    mac_installs: int
+    linux_installs: int
+    last_scraped: Required[IsoTimestamp]
+    fail_reason: str | None
+
+
+type OutputFormat = dict[Name, PackageInfo]
+
+
+async def main(registry: str, output: str, limit: int | None = 20) -> None:
+    try:
+        with open(registry, "r", encoding="utf-8") as f:
+            registry_ = json.load(f)
+    except Exception as e:
+        print(f"fatal: Error loading registry: {e}")
+        return
+
+    input_names = [pkg["name"] for pkg in registry_.get("packages", [])]
+    existing_data = load_existing_data(output)
+
+    to_scrape = packages_to_scrape(input_names, existing_data)
+    to_scrape = to_scrape[:limit]
+
+    now = datetime.now(timezone.utc)
+    now_string = now.strftime("%Y-%m-%d %H:%M:%S")
+    connector = aiohttp.TCPConnector()
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch_package(session, name, now_string) for name in to_scrape]
+        results = await asyncio.gather(*tasks)
+
+    # Merge with existing data
+    for res in results:
+        if res is None:
+            continue
+        existing_data[res["name"]] = res
+
+    # Save back to output json as list
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(existing_data, f, indent=2)
+
+    print(f"Scraped {len(results)} packages, saved to {args.output}")
+
+
+def load_existing_data(output_path) -> OutputFormat:
+    if not os.path.exists(output_path):
+        return {}
+    with open(output_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def packages_to_scrape(input_packages: list[Name], existing_data: OutputFormat) -> list[Name]:
+    return sorted(
+        input_packages,
+        key=lambda name: existing_data.get(name, {}).get("last_scraped", "1970-01-01 00:00:00")
+    )
+
+
+async def fetch_package(session, name: Name, now: IsoTimestamp) -> PackageInfo | None:
+    url_name = quote(name, safe="")
+    url = BASE_URL.format(url_name)
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                print(f"Failed to fetch {name}: HTTP {resp.status}")
+                return {
+                    "name": name,
+                    "last_scraped": now,
+                    "fail_reason": f"HTTP {resp.status}"
+                }
+            text = await resp.text()
+    except Exception as e:
+        print(f"Exception fetching {name}: {e}")
+        return None
+
+    soup = BeautifulSoup(text, "html.parser")
+
+    # Parse first_seen
+    first_seen_span = soup.select_one("#details > ul > li.first_seen > span")
+    first_seen = parse_first_seen(first_seen_span) if first_seen_span else None
+
+    # Parse installs
+    installs_ul = soup.select_one("#installs > ul.totals")
+    installs = parse_installs(installs_ul) if installs_ul else {}
+
+    return {
+        "name": name,
+        "first_seen": first_seen,
+        **installs,
+        "last_scraped": now,
+    }
+
+
+def parse_first_seen(span):
+    # attribute 'title' example: "2025-05-07T18:00:05Z"
+    # replace T with space, strip trailing Z
+    t = span.attrs.get("title")
+    if not t:
+        return None
+    return t.replace("T", " ").rstrip("Z")
+
+
+def parse_installs(ul) -> dict:
+    # ul class="totals", children li:
+    installs = {}
+
+    for li in ul.find_all("li", recursive=False):
+        # span with class total or platform
+        label_span = li.find("span", class_=["total", "platform"])
+        if not label_span:
+            continue
+        label = label_span.text.strip()
+        # The neighbour span that has title attribute with number
+        # It could be a sibling span with class installs, e.g. <span class="installs" title="102">
+        installs_span = label_span.find_next_sibling("span")
+        if not installs_span:
+            continue
+        try:
+            count = int(installs_span.attrs.get("title", "0").replace(",", ""))
+        except Exception:
+            count = 0
+
+        match label:
+            case "Total":
+                installs["total_installs"] = count
+            case "Win":
+                installs["win_installs"] = count
+            case "Mac":
+                installs["mac_installs"] = count
+            case "Linux":
+                installs["linux_installs"] = count
+    return installs
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Scrape packagecontrol.io package info"
+    )
+    parser.add_argument(
+        "-r",
+        "--registry",
+        default=DEFAULT_REGISTRY,
+        help=f"Input registry file with packages (Default: {DEFAULT_REGISTRY})"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=DEFAULT_OUTPUT,
+        help=f"Output JSON file to store results (Default: {DEFAULT_OUTPUT})"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Max number of packages to scrape"
+    )
+    parser.add_argument(
+        "--no-limit",
+        action="store_true",
+        help="If set, scrape all packages (ignore --limit)"
+    )
+    args = parser.parse_args()
+    if args.no_limit and any(a.startswith('--limit') for a in sys.argv):
+        parser.error("Cannot use --limit and --no-limit together.")
+    if args.no_limit:
+        args.limit = None
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    registry = os.path.abspath(args.registry)
+    output = os.path.abspath(args.output)
+    asyncio.run(main(registry, output, args.limit))
