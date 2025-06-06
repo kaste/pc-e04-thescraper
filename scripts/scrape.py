@@ -12,6 +12,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn
 from rich.console import Console
+from datetime import timedelta
 
 
 BASE_URL = "https://packagecontrol.io/packages/{}"
@@ -35,7 +36,7 @@ class PackageInfo(TypedDict, total=False):
 type OutputFormat = dict[Name, PackageInfo]
 
 
-async def main(registry: str, output: str, limit: int | None = 20) -> None:
+async def main(registry: str, output: str, limit: int | None = 20, if_older_than: float | None = None) -> None:
     console = Console()
     # Detect CI or non-interactive environment
     disable_progress = not console.is_terminal or os.environ.get("CI") == "true"
@@ -49,11 +50,18 @@ async def main(registry: str, output: str, limit: int | None = 20) -> None:
     input_names = [pkg["name"] for pkg in registry_.get("packages", [])]
     existing_data = load_existing_data(output)
 
-    to_scrape = packages_to_scrape(input_names, existing_data)
-    to_scrape = to_scrape[:limit]
-
     now = datetime.now(timezone.utc)
     now_string = now.strftime("%Y-%m-%d %H:%M:%S")
+    if_older_than_ = (now - timedelta(hours=if_older_than or 0)).strftime("%Y-%m-%d %H:%M:%S")
+    to_scrape = packages_sorted_by_age(input_names, existing_data, if_older_than_)
+    to_scrape = to_scrape[:limit]
+    if not to_scrape:
+        if if_older_than is not None:
+            local_dt = (now - timedelta(hours=if_older_than)).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"No packages to scrape based on if_older_than={local_dt}.")
+            return
+        print("Nothing to scrape.")
+
     connector = aiohttp.TCPConnector()
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [fetch_package(session, name, now_string) for name in to_scrape]
@@ -98,10 +106,16 @@ def load_existing_data(output_path) -> OutputFormat:
         return json.load(f)
 
 
-def packages_to_scrape(input_packages: list[Name], existing_data: OutputFormat) -> list[Name]:
+def packages_sorted_by_age(input_packages: list[Name], existing_data: OutputFormat, if_older_than: str) -> list[Name]:
     return sorted(
-        input_packages,
-        key=lambda name: existing_data.get(name, {}).get("last_scraped", "1970-01-01 00:00:00")
+        (
+            name
+            for name in input_packages
+            if existing_data.get(name, {}).get("last_scraped", "1970-01-01 00:00:00") <= if_older_than
+        ),
+        key=lambda name: existing_data.get(name, {}).get(
+            "last_scraped", "1970-01-01 00:00:00"
+        ),
     )
 
 
@@ -208,6 +222,12 @@ def parse_args():
         action="store_true",
         help="If set, scrape all packages (ignore --limit)"
     )
+    parser.add_argument(
+        "--if-older-than",
+        type=float,
+        default=None,
+        help="Only scrape packages if last_scraped is older than N hours (or missing)"
+    )
     args = parser.parse_args()
     if args.no_limit and any(a.startswith('--limit') for a in sys.argv):
         parser.error("Cannot use --limit and --no-limit together.")
@@ -220,4 +240,4 @@ if __name__ == "__main__":
     args = parse_args()
     registry = os.path.abspath(args.registry)
     output = os.path.abspath(args.output)
-    asyncio.run(main(registry, output, args.limit))
+    asyncio.run(main(registry, output, args.limit, args.if_older_than))
